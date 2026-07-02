@@ -56,90 +56,110 @@ pub fn build_init_script(profile: &DeviceProfile, seed: &FingerprintSeed) -> Str
 
     format!(
         r#"(function() {{
-  if (window.__stealth_applied) {{ return; }}
-  var SEED_HEX = {seed_hex};
+  // First-line sentinel — must be visible from post-probe even if
+  // the rest of the IIFE throws. seed_hex is a hex string and must
+  // be quoted — without quotes, JS parses it as decimal and chokes
+  // on the embedded `e` (e.g. `9800...e780...`).
+  window.__stealth_iife_ran = true;
+  window.__stealth_iife_seed = "{seed_hex}";
+  // No idempotency guard: a single page can be re-seeded with a
+  // different FingerprintSeed (e.g. between A/B test cohorts), and
+  // the second call must see the new NOISE_PIXELS, new UA, new
+  // profile. Every step below is idempotent — `defineProperty`
+  // overwrites the previous getter, and prototype hook functions
+  // overwrite previous hooks — so re-applying with a new seed is
+  // safe.
+  var SEED_HEX = "{seed_hex}";
   var APPLIED_AT = Date.now();
-  try {{
-    // 1. Delete navigator.webdriver — return undefined, not false. CreepJS
-    //    checks `in navigator` to distinguish 'false' from 'undefined'.
-    Object.defineProperty(Navigator.prototype, 'webdriver', {{
-      get: function () {{ return undefined; }},
-      set: function () {{}},
-      configurable: true,
-      enumerable: true,
-    }});
-  }} catch (e) {{}}
 
-  try {{
-    Object.defineProperty(Navigator.prototype, 'platform', {{
-      get: function () {{ return {platform_json}; }},
-      configurable: true,
-    }});
-  }} catch (e) {{}}
+  // Helper: override a property on BOTH Navigator.prototype AND the
+  // navigator instance. Modern Chrome defines some properties (webdriver,
+  // languages, hardwareConcurrency, deviceMemory) as *own* properties on
+  // the instance, with a getter on the prototype. Defining only on the
+  // prototype does NOT shadow the instance own property, so we have to
+  // hit both. We also `delete` first in case the property is an own
+  // data-property (in which case defineProperty would throw).
+  function overrideGetter(name, getter) {{
+    try {{
+      window.__stealth_step = (window.__stealth_step || 0) + 1;
+      try {{ delete Navigator.prototype[name]; }} catch (e) {{}}
+      Object.defineProperty(Navigator.prototype, name, {{
+        get: getter,
+        configurable: true,
+        enumerable: true,
+      }});
+    }} catch (e) {{
+      window.__stealth_last_err = name + ':proto:' + (e && e.message);
+    }}
+    try {{
+      window.__stealth_step = (window.__stealth_step || 0) + 1;
+      try {{ delete navigator[name]; }} catch (e) {{}}
+      Object.defineProperty(navigator, name, {{
+        get: getter,
+        configurable: true,
+        enumerable: true,
+      }});
+    }} catch (e) {{
+      window.__stealth_last_err = name + ':inst:' + (e && e.message);
+    }}
+  }}
 
-  try {{
-    Object.defineProperty(Navigator.prototype, 'language', {{
-      get: function () {{ return {primary_lang_json}; }},
-      configurable: true,
-    }});
-    Object.defineProperty(Navigator.prototype, 'languages', {{
-      get: function () {{ return {languages_json}; }},
-      configurable: true,
-    }});
-  }} catch (e) {{}}
+  // 1. navigator.webdriver — return undefined, not false. CreepJS checks
+  //    `in navigator` to distinguish 'false' from 'undefined'.
+  overrideGetter('webdriver', function () {{ return undefined; }});
 
-  try {{
-    Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', {{
-      get: function () {{ return {hardware_concurrency}; }},
-      configurable: true,
-    }});
-    Object.defineProperty(Navigator.prototype, 'deviceMemory', {{
-      get: function () {{ return {device_memory}; }},
-      configurable: true,
-    }});
-  }} catch (e) {{}}
+  // 2. platform
+  overrideGetter('platform', function () {{ return {platform_json}; }});
 
-  try {{
-    var UA_DATA = {{
-      brands: {brands_json},
-      mobile: false,
-      platform: {ua_ch_platform_json},
-      platformVersion: {ua_ch_platform_version_json},
-      architecture: 'x86',
-      bitness: '64',
-      model: '',
-      uaFullVersion: '',
-      wow64: false,
-      getHighEntropyValues: function (hints) {{
-        return Promise.resolve({{
-          architecture: 'x86',
-          bitness: '64',
-          brands: UA_DATA.brands,
-          mobile: false,
-          model: '',
-          platform: UA_DATA.platform,
-          platformVersion: UA_DATA.platformVersion,
-          uaFullVersion: '',
-          wow64: false,
-        }});
-      }},
-      toJSON: function () {{ return UA_DATA; }},
-    }};
-    Object.defineProperty(Navigator.prototype, 'userAgentData', {{
-      get: function () {{ return UA_DATA; }},
-      configurable: true,
-    }});
-  }} catch (e) {{}}
+  // 3. language + languages
+  overrideGetter('language', function () {{ return {primary_lang_json}; }});
+  overrideGetter('languages', function () {{ return {languages_json}; }});
+
+  // 4. hardwareConcurrency + deviceMemory
+  overrideGetter('hardwareConcurrency', function () {{ return {hardware_concurrency}; }});
+  overrideGetter('deviceMemory', function () {{ return {device_memory}; }});
+
+  // 5. userAgentData (UA-CH) — full HighEntropyValues response
+  var UA_DATA = {{
+    brands: {brands_json},
+    mobile: false,
+    platform: {ua_ch_platform_json},
+    platformVersion: {ua_ch_platform_version_json},
+    architecture: 'x86',
+    bitness: '64',
+    model: '',
+    uaFullVersion: '',
+    wow64: false,
+    getHighEntropyValues: function (hints) {{
+      return Promise.resolve({{
+        architecture: 'x86',
+        bitness: '64',
+        brands: UA_DATA.brands,
+        mobile: false,
+        model: '',
+        platform: UA_DATA.platform,
+        platformVersion: UA_DATA.platformVersion,
+        uaFullVersion: '',
+        wow64: false,
+      }});
+    }},
+    toJSON: function () {{ return UA_DATA; }},
+  }};
+  overrideGetter('userAgentData', function () {{ return UA_DATA; }});
 
   // 5. Canvas LSB noise. We use a fixed list of {noise_count} pixel indices
   //    derived from the seed. The same indices are used for getImageData and
   //    toDataURL / toBlob, so any canvas fingerprint is consistent across
   //    APIs.
   var NOISE_PIXELS = {noise_pixels_json};
+  // Expose for diagnostic / cross-run hash verification from the host.
+  window.__stealth_noise_pixels = NOISE_PIXELS;
+  window.__stealth_noise_calls = 0;
   function applyCanvasNoise(ctx, w, h) {{
     if (!ctx) return;
     var img;
     try {{ img = ctx.getImageData(0, 0, w, h); }} catch (e) {{ return; }}
+    window.__stealth_noise_calls = (window.__stealth_noise_calls || 0) + 1;
     var data = img.data;
     for (var i = 0; i < NOISE_PIXELS.length; i++) {{
       var idx = NOISE_PIXELS[i] * 4;
@@ -239,24 +259,33 @@ pub fn build_init_script(profile: &DeviceProfile, seed: &FingerprintSeed) -> Str
     )
 }
 
+/// Default canvas dimensions used by the probe and the noise pixel range.
+/// Indexed as a single linear index = `y * WIDTH + x`, so the valid range
+/// is `[0, WIDTH * HEIGHT)`.
+pub const CANVAS_WIDTH: u32 = 280;
+pub const CANVAS_HEIGHT: u32 = 60;
+pub const CANVAS_PIXELS: u32 = CANVAS_WIDTH * CANVAS_HEIGHT;
+
 /// Derive 20 canvas-noise pixel indices from a 16-byte seed. The same seed
 /// always yields the same list, so the canvas fingerprint is stable across
 /// runs and across users with the same seed.
+///
+/// Each output is a u32 in `[0, CANVAS_PIXELS)` — values outside this range
+/// would be silently no-op'd by the canvas hook (the `idx + 3 < data.length`
+/// check), defeating the noise. We pack two seed bytes per slot, fold
+/// with a per-slot mix of the running index, and reduce mod the canvas size.
 pub fn derive_canvas_noise_pixels(seed: &[u8; 16]) -> [u32; CANVAS_NOISE_PIXEL_COUNT] {
-    // 4 bytes per pixel * 20 = 80 bytes; we only have 16. We stretch the
-    // seed by feeding each subsequent index's offset back into the running
-    // accumulator. This is not cryptographically uniform but is *stable*,
-    // which is the only property we need.
     let mut out = [0u32; CANVAS_NOISE_PIXEL_COUNT];
-    let mut acc: u32 = 0;
     for (i, slot) in out.iter_mut().enumerate() {
-        let b0 = seed[i % 16] as u32;
-        let b1 = seed[(i + 5) % 16] as u32;
-        let b2 = seed[(i + 11) % 16] as u32;
-        let b3 = seed[(i + 13) % 16] as u32;
-        acc = acc.wrapping_add(1);
-        let v = (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
-        *slot = acc.wrapping_add(v);
+        // Use two seed bytes per slot, with a per-slot index mix so
+        // adjacent slots don't share the same pair of bytes.
+        let b0 = seed[(i * 2) % 16] as u32;
+        let b1 = seed[(i * 2 + 1) % 16] as u32;
+        let mut v = (b0 << 8) | b1; // 0..=65535
+        // Mix the slot index in to break the obvious pattern if the seed
+        // bytes happen to be the same for two consecutive slots.
+        v ^= (i as u32).wrapping_mul(0x9e3779b9);
+        *slot = v % CANVAS_PIXELS;
     }
     out
 }

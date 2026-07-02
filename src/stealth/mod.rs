@@ -158,26 +158,22 @@ impl Page {
         });
 
         // 6. Runtime.evaluate on the current document.
-        let eval_params = EvaluateParams {
-            expression: script,
-            object_group: None,
-            include_command_line_api: None,
-            silent: None,
-            context_id: None,
-            return_by_value: Some(true),
-            generate_preview: None,
-            user_gesture: None,
-            await_promise: None,
-            throw_on_side_effect: None,
-            timeout: None,
-            disable_breaks: None,
-            repl_mode: None,
-            allow_unsafe_eval_blocked_by_csp: None,
-            unique_context_id: None,
-            serialization_options: None,
-            eval_as_function_fallback: None,
-        };
-        self.execute(eval_params).await?;
+        //
+        // CRITICAL: we route the evaluation through `evaluate_expression`,
+        // not `self.execute(EvaluateParams)`. The latter sends
+        // `Runtime.evaluate` with no `contextId`, and Chrome routes that
+        // to the *isolated* (utility) world of the target — a different
+        // JS realm whose `window` and `Navigator.prototype` are not the
+        // main world's. Changes to the isolated world's `Navigator`
+        // prototype are not visible from the main world, so stealth's
+        // property overrides silently fail.
+        //
+        // `evaluate_expression` resolves the main-world `ExecutionContextId`
+        // internally and pins the evaluation there. The script's effects
+        // (Navigator.prototype getter overrides, `window.__stealth_*`
+        // sentinels) are then visible to subsequent main-world code
+        // (e.g. page scripts, fingerprint detection pages).
+        let _ = self.evaluate_expression(script).await?;
         applied.push(AppliedStep {
             name: "Runtime.evaluate",
             no_op: false,
