@@ -1356,4 +1356,50 @@ mod tests {
             assert!(!ua1.is_empty());
         }
     }
+
+    /// M7.1: Verify the ScreenSpec fields can be plugged into the CDP
+    /// `Emulation.setDeviceMetricsOverride` builder for every profile.
+    /// This catches type conversion errors (u32 -> i64, f32 -> f64) and
+    /// the iOS Safari special-case (mobile=true with iPhone screen).
+    #[test]
+    fn all_10_profiles_build_cdp_device_metrics_override() {
+        use crate::cdp::browser_protocol::emulation::SetDeviceMetricsOverrideParams;
+
+        for id in [
+            DeviceProfileId::Win11Chrome120IntelNvidia,
+            DeviceProfileId::Win10Chrome120IntelNvidia,
+            DeviceProfileId::MacOs14Chrome120M1,
+            DeviceProfileId::LinuxUbuntuChrome120XeonMesa,
+            DeviceProfileId::Win11Chrome120AmdAmd,
+            DeviceProfileId::DesktopChrome148Win11,
+            DeviceProfileId::IosSafariIphone14,
+            DeviceProfileId::AndroidChromePixel7,
+            DeviceProfileId::AndroidWebViewPixel7,
+            DeviceProfileId::IosWkWebviewIphone14,
+        ] {
+            let p = id.profile();
+            let result = SetDeviceMetricsOverrideParams::builder()
+                .width(p.screen.width as i64)
+                .height(p.screen.height as i64)
+                .device_scale_factor(p.screen.device_pixel_ratio as f64)
+                .mobile(p.uach.mobile)
+                .build();
+            assert!(
+                result.is_ok(),
+                "{:?} failed to build SetDeviceMetricsOverrideParams: {:?}",
+                id,
+                result.err()
+            );
+            let built = result.unwrap();
+            assert_eq!(built.width, p.screen.width as i64, "{:?} width", id);
+            assert_eq!(built.height, p.screen.height as i64, "{:?} height", id);
+            assert_eq!(
+                built.device_scale_factor,
+                p.screen.device_pixel_ratio as f64,
+                "{:?} device_scale_factor",
+                id
+            );
+            assert_eq!(built.mobile, p.uach.mobile, "{:?} mobile", id);
+        }
+    }
 }

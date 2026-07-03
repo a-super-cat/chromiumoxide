@@ -60,7 +60,9 @@ pub use launch_args::{
     window_size_for_family_id,
 };
 
-use crate::cdp::browser_protocol::emulation::SetTimezoneOverrideParams;
+use crate::cdp::browser_protocol::emulation::{
+    SetDeviceMetricsOverrideParams, SetTimezoneOverrideParams, SetTouchEmulationEnabledParams,
+};
 use crate::cdp::browser_protocol::network::SetUserAgentOverrideParams;
 use crate::cdp::browser_protocol::page::AddScriptToEvaluateOnNewDocumentParams;
 use crate::cdp::js_protocol::runtime::EvaluateParams;
@@ -127,7 +129,7 @@ impl Page {
 
         // 3. Build the JS payload.
         let script = build_init_script(&profile, &seed);
-        let mut applied = Vec::with_capacity(4);
+        let mut applied = Vec::with_capacity(6);
 
         // 4. Apply the CDP-level overrides that must precede the script
         //    (UA + Accept-Language header, timezone).
@@ -162,6 +164,38 @@ impl Page {
         self.execute(tz_params).await?;
         applied.push(AppliedStep {
             name: "Emulation.setTimezoneOverride",
+            no_op: false,
+        });
+
+        // 4c. M7.1: Emulation.setDeviceMetricsOverride + setTouchEmulationEnabled.
+        //      Overrides the actual layout viewport (window.innerWidth/Height,
+        //      document.documentElement.clientWidth/Height, CSS media query
+        //      device-width/device-height) and enables touch for mobile/webview
+        //      families. The JS layer's window.screen.* + devicePixelRatio
+        //      overrides complement this by handling the surface that CDP
+        //      cannot set (screen.availWidth, colorDepth, pixelDepth).
+        let device_params = SetDeviceMetricsOverrideParams::builder()
+            .width(profile.screen.width as i64)
+            .height(profile.screen.height as i64)
+            .device_scale_factor(profile.screen.device_pixel_ratio as f64)
+            .mobile(profile.uach.mobile)
+            .build()
+            .map_err(|e| {
+                CdpError::msg(format!(
+                    "Emulation.setDeviceMetricsOverride builder failed: {}",
+                    e
+                ))
+            })?;
+        self.execute(device_params).await?;
+        applied.push(AppliedStep {
+            name: "Emulation.setDeviceMetricsOverride",
+            no_op: false,
+        });
+
+        let touch_params = SetTouchEmulationEnabledParams::new(profile.uach.mobile);
+        self.execute(touch_params).await?;
+        applied.push(AppliedStep {
+            name: "Emulation.setTouchEmulationEnabled",
             no_op: false,
         });
 
@@ -273,7 +307,7 @@ impl Page {
             user_agent_metadata: None,
         };
         self.execute(ua_params).await?;
-        let mut applied = Vec::with_capacity(4);
+        let mut applied = Vec::with_capacity(6);
         applied.push(AppliedStep {
             name: "Network.setUserAgentOverride",
             no_op: false,
@@ -285,6 +319,38 @@ impl Page {
         self.execute(tz_params).await?;
         applied.push(AppliedStep {
             name: "Emulation.setTimezoneOverride",
+            no_op: false,
+        });
+
+        // 1c. M7.1: Emulation.setDeviceMetricsOverride + setTouchEmulationEnabled.
+        //      Overrides the actual layout viewport (window.innerWidth/Height,
+        //      document.documentElement.clientWidth/Height, CSS media query
+        //      device-width/device-height) and enables touch for mobile/webview
+        //      families. The JS layer's window.screen.* + devicePixelRatio
+        //      overrides complement this by handling the surface that CDP
+        //      cannot set (screen.availWidth, colorDepth, pixelDepth).
+        let device_params = SetDeviceMetricsOverrideParams::builder()
+            .width(profile.screen.width as i64)
+            .height(profile.screen.height as i64)
+            .device_scale_factor(profile.screen.device_pixel_ratio as f64)
+            .mobile(profile.uach.mobile)
+            .build()
+            .map_err(|e| {
+                CdpError::msg(format!(
+                    "Emulation.setDeviceMetricsOverride builder failed: {}",
+                    e
+                ))
+            })?;
+        self.execute(device_params).await?;
+        applied.push(AppliedStep {
+            name: "Emulation.setDeviceMetricsOverride",
+            no_op: false,
+        });
+
+        let touch_params = SetTouchEmulationEnabledParams::new(profile.uach.mobile);
+        self.execute(touch_params).await?;
+        applied.push(AppliedStep {
+            name: "Emulation.setTouchEmulationEnabled",
             no_op: false,
         });
 
