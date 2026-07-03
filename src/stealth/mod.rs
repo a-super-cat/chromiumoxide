@@ -37,6 +37,7 @@
 //! produced on every run, on every platform.
 
 pub mod alignment;
+pub mod launch_args;
 pub mod params;
 pub mod profiles;
 pub mod script;
@@ -53,6 +54,10 @@ pub use script::{
 };
 pub use validator::{
     validate_profile, Inconsistency, InconsistencyKind, ValidationReport, Severity,
+};
+pub use launch_args::{
+    launch_args_for_family, launch_args_for_family_id, window_size_for_family,
+    window_size_for_family_id,
 };
 
 use crate::cdp::browser_protocol::emulation::SetTimezoneOverrideParams;
