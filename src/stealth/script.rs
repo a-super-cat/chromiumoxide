@@ -722,6 +722,85 @@ fn build_init_script_with_build_fingerprint(
     window.__stealth_last_err = 'm8_1:' + (e && e.message);
   }}
 
+  // 9d. M9 getStats() IP filter (defense in depth over M9 chromium C++).
+  // Wraps RTCStatsReport.prototype.entries / forEach / keys / values /
+  // get to remove IP addresses from RTCIceCandidateStats entries
+  // (type === "local-candidate" or "remote-candidate"). The C++ layer
+  // M9 already filters onicecandidate; this JS layer catches the
+  // getStats() surface (which the C++ layer can't modify because
+  // webrtc::RTCStatsReport is const).
+  try {{
+    if (window.RTCStatsReport && RTCStatsReport.prototype) {{
+      var PROTO = RTCStatsReport.prototype;
+      var isPrivate = function(ip) {{
+        if (!ip) return false;
+        var m = ip.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
+        if (!m) return false;  // not IPv4, let through (IPv6 case)
+        var o1 = +m[1], o2 = +m[2];
+        if (o1 === 10) return true;
+        if (o1 === 127) return true;
+        if (o1 === 172 && o2 >= 16 && o2 <= 31) return true;
+        if (o1 === 192 && o2 === 168) return true;
+        if (o1 === 169 && o2 === 254) return true;
+        if (o1 === 0) return true;
+        return false;
+      }};
+      var sanitizeStat = function(stat) {{
+        if (!stat || typeof stat !== 'object') return stat;
+        if (stat.type === 'local-candidate' || stat.type === 'remote-candidate') {{
+          if (isPrivate(stat.address)) {{
+            stat.address = '0.0.0.0';
+          }}
+          if (isPrivate(stat.relatedAddress)) {{
+            stat.relatedAddress = '0.0.0.0';
+          }}
+        }}
+        return stat;
+      }};
+      // maplike interface: get(), has(), entries(), keys(), values(), forEach()
+      if (!PROTO.__stealth_getstats_wrapped) {{
+        var origEntries = PROTO.entries;
+        var origForEach = PROTO.forEach;
+        var origGet = PROTO.get;
+        var wrapIterator = function(orig) {{
+          if (!orig) return orig;
+          return function() {{
+            var iter = orig.apply(this, arguments);
+            var origNext = iter.next.bind(iter);
+            iter.next = function() {{
+              var r = origNext();
+              if (r && r.value) {{
+                if (Array.isArray(r.value) && r.value.length === 2) {{
+                  r.value[1] = sanitizeStat(r.value[1]);
+                }} else {{
+                  r.value = sanitizeStat(r.value);
+                }}
+              }}
+              return r;
+            }};
+            return iter;
+          }};
+        }};
+        PROTO.entries = wrapIterator(origEntries);
+        if (origForEach) {{
+          PROTO.forEach = function(cb, thisArg) {{
+            return origForEach.call(this, function(stat, key) {{
+              cb.call(thisArg, sanitizeStat(stat), key, this);
+            }}, thisArg);
+          }};
+        }}
+        if (origGet) {{
+          PROTO.get = function(key) {{
+            return sanitizeStat(origGet.call(this, key));
+          }};
+        }}
+        PROTO.__stealth_getstats_wrapped = true;
+      }}
+    }}
+  }} catch (e) {{
+    window.__stealth_last_err = 'm9_getstats:' + (e && e.message);
+  }}
+
   // 9c. M10.2 Date.prototype timezone override.
   // Defense in depth over M5.5+ CDP Emulation.setTimezoneOverride.
   // CDP override makes chromium-side Date report the profile timezone.
@@ -1058,6 +1137,29 @@ mod tests {
 
         // shiftDate helper must be defined.
         assert!(la_script.contains("function shiftDate"));
+    }
+
+    /// M9: Verify the RTCStatsReport.prototype wrapping section is
+    /// present in the init script and the isPrivate helper covers
+    /// the private IPv4 ranges.
+    #[test]
+    fn init_script_contains_m9_getstats_ip_filter() {
+        let seed = FingerprintSeed::ZERO;
+        let profile = DeviceProfileId::DesktopChrome148Win11.profile();
+        let script = build_init_script(&profile, &seed);
+        assert!(
+            script.contains("M9 getStats() IP filter"),
+            "script missing M9 getStats section"
+        );
+        // The maplike wrapping is present.
+        assert!(script.contains("RTCStatsReport.prototype"));
+        assert!(script.contains("__stealth_getstats_wrapped"));
+        // isPrivate covers RFC 1918 + loopback + link-local.
+        assert!(script.contains("isPrivate"));
+        // sanitizeStat for local-candidate / remote-candidate types.
+        assert!(script.contains("local-candidate"));
+        assert!(script.contains("remote-candidate"));
+        assert!(script.contains("sanitizeStat"));
     }
 
     #[test]
