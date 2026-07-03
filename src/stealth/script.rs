@@ -107,6 +107,28 @@ pub fn build_init_script(profile: &DeviceProfile, seed: &FingerprintSeed) -> Str
         // Desktop families
         (48000, 0.010, 0.020)
     };
+
+    // M10.2: tz_offset_minutes from profile.locale.timezone_id. Used by
+    // the Date.prototype timezone override (9c). Lookup table covers
+    // the timezones used by the 10 M5.5+ profile families. Returns
+    // null for unknown timezones (then 9c is a no-op).
+    let tz_offset_minutes: Option<i32> = match profile.locale.timezone_id {
+        "America/Los_Angeles" => Some(-480),  // PST (no DST)
+        "America/New_York" => Some(-300),     // EST (no DST)
+        "America/Chicago" => Some(-360),      // CST (no DST)
+        "Europe/London" => Some(0),           // GMT (no DST)
+        "Europe/Berlin" => Some(60),          // CET (no DST)
+        "Europe/Paris" => Some(60),           // CET (no DST)
+        "Asia/Shanghai" => Some(480),         // CST China (no DST)
+        "Asia/Tokyo" => Some(540),            // JST (no DST)
+        "Asia/Singapore" => Some(480),        // SGT (no DST)
+        "Australia/Sydney" => Some(600),      // AEST (no DST, ignoring +1 for DST)
+        _ => None,
+    };
+    let tz_offset_minutes_js = match tz_offset_minutes {
+        Some(m) => m.to_string(),
+        None => "null".to_string(),
+    };
     let webgl_vendor_json = serde_json::to_string(profile.webgl.unmasked_vendor)
         .expect("static &str cannot fail JSON encoding");
     let webgl_renderer_json = serde_json::to_string(profile.webgl.unmasked_renderer)
@@ -171,6 +193,7 @@ pub fn build_init_script(profile: &DeviceProfile, seed: &FingerprintSeed) -> Str
         audio_sample_rate,
         audio_base_latency,
         audio_output_latency,
+        tz_offset_minutes_js,
         brands_json,
         uach_architecture_json,
         uach_bitness_json,
@@ -217,6 +240,7 @@ fn build_init_script_with_build_fingerprint(
     audio_sample_rate: u32,
     audio_base_latency: f32,
     audio_output_latency: f32,
+    tz_offset_minutes_js: String,
     brands_json: String,
     uach_architecture_json: String,
     uach_bitness_json: String,
@@ -679,7 +703,7 @@ fn build_init_script_with_build_fingerprint(
         if (origFreqValueGet && origFreqValueGet.get) {{
           Object.defineProperty(window.AudioParam.prototype, 'value', {{
             get: function() {{
-              var v = origFreqValueGet.get.call(this);
+              var v = origFreqValueGet.call(this);
               // Only offset for OscillatorNode-related AudioParams
               // (heuristic: check if context is OscillatorNode).
               try {{
@@ -696,6 +720,41 @@ fn build_init_script_with_build_fingerprint(
     }}
   }} catch (e) {{
     window.__stealth_last_err = 'm8_1:' + (e && e.message);
+  }}
+
+  // 9c. M10.2 Date.prototype timezone override.
+  // Defense in depth over M5.5+ CDP Emulation.setTimezoneOverride.
+  // CDP override makes chromium-side Date report the profile timezone.
+  // This JS layer wraps Date.prototype.getHours / getMinutes / getSeconds /
+  // getDate / getMonth / getDay / getTimezoneOffset so that even if CDP
+  // override is bypassed (e.g. when JS reads Date via a different code
+  // path like Date.now() + manual offset), the values are still consistent
+  // with the profile timezone.
+  try {{
+    var TZ_OFFSET_MIN = {tz_offset_minutes_js};
+    if (TZ_OFFSET_MIN !== null && typeof Date !== 'undefined') {{
+      var origGetHours = Date.prototype.getHours;
+      var origGetMinutes = Date.prototype.getMinutes;
+      var origGetSeconds = Date.prototype.getSeconds;
+      var origGetDate = Date.prototype.getDate;
+      var origGetMonth = Date.prototype.getMonth;
+      var origGetDay = Date.prototype.getDay;
+      var origGetTimezoneOffset = Date.prototype.getTimezoneOffset;
+
+      function shiftDate(t) {{
+        return new Date(t.getTime() + TZ_OFFSET_MIN * 60 * 1000 + t.getTimezoneOffset() * 60 * 1000);
+      }}
+
+      Date.prototype.getHours = function() {{ return shiftDate(this).getUTCHours(); }};
+      Date.prototype.getMinutes = function() {{ return shiftDate(this).getUTCMinutes(); }};
+      Date.prototype.getSeconds = function() {{ return shiftDate(this).getUTCSeconds(); }};
+      Date.prototype.getDate = function() {{ return shiftDate(this).getUTCDate(); }};
+      Date.prototype.getMonth = function() {{ return shiftDate(this).getUTCMonth(); }};
+      Date.prototype.getDay = function() {{ return shiftDate(this).getUTCDay(); }};
+      Date.prototype.getTimezoneOffset = function() {{ return TZ_OFFSET_MIN; }};
+    }}
+  }} catch (e) {{
+    window.__stealth_last_err = 'm10_2:' + (e && e.message);
   }}
 
   window.__stealth_applied = true;
@@ -740,6 +799,7 @@ fn build_init_script_with_build_fingerprint(
         audio_sample_rate = audio_sample_rate,
         audio_base_latency = audio_base_latency,
         audio_output_latency = audio_output_latency,
+        tz_offset_minutes_js = tz_offset_minutes_js,
         noise_pixels_json = noise_pixels_json,
     )
 }
@@ -955,6 +1015,49 @@ mod tests {
             desktop_script.contains("AudioParam"),
             "AudioParam.value hook present"
         );
+    }
+
+    /// M10.2: Verify the Date.prototype timezone override is present
+    /// in the init script and the profile-driven tz_offset_minutes
+    /// makes it through to the JS payload.
+    #[test]
+    fn init_script_contains_m10_2_date_timezone_override() {
+        let seed = FingerprintSeed::ZERO;
+
+        // America/Los_Angeles profile: tz_offset_minutes = -480 (PST).
+        // Win11 Chrome 120 uses LA timezone per profiles.rs.
+        let la = DeviceProfileId::Win11Chrome120IntelNvidia.profile();
+        let la_script = build_init_script(&la, &seed);
+        assert!(
+            la_script.contains("M10.2 Date.prototype timezone override"),
+            "script missing M10.2 section"
+        );
+        assert!(la_script.contains("TZ_OFFSET_MIN = -480"), "LA offset");
+
+        // America/New_York: -300 (EST). Android Chrome Pixel 7 uses NY.
+        let ny = DeviceProfileId::AndroidChromePixel7.profile();
+        let ny_script = build_init_script(&ny, &seed);
+        assert!(ny_script.contains("TZ_OFFSET_MIN = -300"), "NY offset");
+
+        // All Date methods must be wrapped.
+        for method in &[
+            "getHours",
+            "getMinutes",
+            "getSeconds",
+            "getDate",
+            "getMonth",
+            "getDay",
+            "getTimezoneOffset",
+        ] {
+            assert!(
+                la_script.contains(&format!("Date.prototype.{}", method)),
+                "Date.prototype.{} wrapper present",
+                method
+            );
+        }
+
+        // shiftDate helper must be defined.
+        assert!(la_script.contains("function shiftDate"));
     }
 
     #[test]
