@@ -265,6 +265,33 @@ fn build_init_script_with_build_fingerprint(
   var SEED_HEX = "{seed_hex}";
   var APPLIED_AT = Date.now();
 
+  // M4 patch 2 (defense in depth over M5.5+ JS init script):
+  // cleanup automation globals that ChromeDriver / Selenium / Playwright /
+  // etc. inject into the main world. These are universal
+  // anti-bot-detection signals — every sophisticated detector checks for
+  // them. Runs at addScriptToEvaluateOnNewDocument time, before any
+  // page script, so the page never sees the dirty globals.
+  //
+  // The chromium C++ equivalent would hook LocalDOMWindow::InstallNewDocument
+  // and call ClassicScript::RunScriptOnScriptState — too much V8 plumbing
+  // for a 5-line JS loop. Functionally equivalent.
+  try {{
+    var _automKeys = Object.keys(window);
+    for (var _ai = 0; _ai < _automKeys.length; _ai++) {{
+      var _ak = _automKeys[_ai];
+      if (_ak.indexOf('$cdc_') === 0 || _ak === '__playwright__' ||
+          _ak.indexOf('__pw_') === 0 || _ak === '__nightmare' ||
+          _ak === '__selenium_evaluate' || _ak === '__webdriver_evaluate' ||
+          _ak === '__driver_evaluate' || _ak === '__fxdriver_evaluate' ||
+          _ak === '__driver_unwrap' || _ak === '__webdriver_unwrap' ||
+          _ak === '__webdriver_script_function' ||
+          _ak === '__lastWatirAlert' || _ak === '__lastWatirConfirm' ||
+          _ak === '__lastWatirPrompt') {{
+        try {{ delete window[_ak]; }} catch (e1) {{}}
+      }}
+    }}
+  }} catch (e0) {{}}
+
   function overrideGetter(name, getter) {{
     try {{
       window.__stealth_step = (window.__stealth_step || 0) + 1;
@@ -654,5 +681,58 @@ mod tests {
         assert!(script.contains("37445"));
         assert!(script.contains("37446"));
         assert!(script.contains("Google Inc. (NVIDIA)"));
+    }
+
+    #[test]
+    fn init_script_cleans_automation_globals() {
+        // M4 patch 2: the init script must clean $cdc_*, __playwright__,
+        // __pw_*, __nightmare, __selenium_evaluate, etc. from
+        // window. This is the JS-side implementation (chromium C++
+        // version deferred to follow-up).
+        let profile = DeviceProfileId::DesktopChrome148Win11.profile();
+        let seed = FingerprintSeed::ZERO;
+        let script = build_init_script(&profile, &seed);
+        // Each automation marker must appear at least once in the
+        // cleanup loop (i.e., the script must reference it).
+        assert!(
+            script.contains("$cdc_"),
+            "init script missing $cdc_ cleanup"
+        );
+        assert!(
+            script.contains("__playwright__"),
+            "init script missing __playwright__ cleanup"
+        );
+        assert!(
+            script.contains("__pw_"),
+            "init script missing __pw_ cleanup"
+        );
+        assert!(
+            script.contains("__nightmare"),
+            "init script missing __nightmare cleanup"
+        );
+        assert!(
+            script.contains("__selenium_evaluate"),
+            "init script missing __selenium_evaluate cleanup"
+        );
+        assert!(
+            script.contains("__webdriver_evaluate"),
+            "init script missing __webdriver_evaluate cleanup"
+        );
+        assert!(
+            script.contains("__driver_evaluate"),
+            "init script missing __driver_evaluate cleanup"
+        );
+        // Verify the cleanup is at the START of the IIFE (before any
+        // other stealth work) by checking it appears before the
+        // navigator.vendor override.
+        let cdc_idx = script.find("$cdc_").expect("$cdc_ present");
+        let vendor_idx = script
+            .find("overrideGetter('vendor'")
+            .or_else(|| script.find("overrideGetter(\"vendor\""))
+            .expect("vendor override present");
+        assert!(
+            cdc_idx < vendor_idx,
+            "automation cleanup must run before navigator override"
+        );
     }
 }
