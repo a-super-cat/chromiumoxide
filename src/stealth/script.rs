@@ -386,6 +386,113 @@ fn build_init_script_with_build_fingerprint(
   }} catch (e) {{
     window.__stealth_last_err = 'screen:' + (e && e.message);
   }}
+
+  // 5d. M7.2 high-DPI media queries + iframe dimensions + visual viewport
+  // Defense in depth over M7.1 (CDP Emulation.setDeviceMetricsOverride).
+  // CDP sets the actual layout viewport; this section handles the surface
+  // that CDP doesn't reach (CSS media query matchMedia(), iframe
+  // contentWindow, window.visualViewport for mobile families).
+  try {{
+    // 5d.1 high-DPI media queries. Override window.matchMedia so that
+    // (resolution: 2dppx), (min-resolution: ...), (max-resolution: ...)
+    // return matches based on profile devicePixelRatio, not the host OS.
+    (function() {{
+      var DPR = {device_pixel_ratio};
+      var origMatchMedia = window.matchMedia ? window.matchMedia.bind(window) : null;
+      if (origMatchMedia) {{
+        window.matchMedia = function(query) {{
+          var q = String(query || '');
+          var m = q.match(/(min-|max-)?resolution\s*:\s*(\d+(?:\.\d+)?)(dppx|dpcm|dpi)/i);
+          if (m) {{
+            var cmp = m[1] || '';
+            var val = parseFloat(m[2]);
+            var unit = m[3].toLowerCase();
+            var dppx = unit === 'dppx' ? val : (unit === 'dpcm' ? val / 2.54 : val / 96.0);
+            var matches = false;
+            if (cmp === 'min-') matches = DPR >= dppx - 1e-6;
+            else if (cmp === 'max-') matches = DPR <= dppx + 1e-6;
+            else matches = Math.abs(DPR - dppx) < 1e-6;
+            return {{
+              matches: matches,
+              media: q,
+              onchange: null,
+              addListener: function() {{}},
+              removeListener: function() {{}},
+              addEventListener: function() {{}},
+              removeEventListener: function() {{}},
+              dispatchEvent: function() {{ return true; }}
+            }};
+          }}
+          return origMatchMedia(q);
+        }};
+      }}
+    }})();
+
+    // 5d.2 iframe contentWindow dimensions. Walk the iframe tree and
+    // set child contentWindow.innerWidth/Height to match the parent's
+    // (profile-driven) viewport, so fingerprinters that compare parent
+    // vs iframe get consistent values. Cross-origin iframes silently
+    // fail (caught).
+    (function() {{
+      var SYN_W = {screen_width};
+      var SYN_H = {screen_height};
+      function syncIframes(root) {{
+        try {{
+          var iframes = root.querySelectorAll ? root.querySelectorAll('iframe') : [];
+          for (var i = 0; i < iframes.length; i++) {{
+            var iframe = iframes[i];
+            try {{
+              var cw = iframe.contentWindow;
+              if (cw && cw !== window) {{
+                Object.defineProperty(cw, 'innerWidth', {{ get: function() {{ return SYN_W; }}, configurable: true }});
+                Object.defineProperty(cw, 'innerHeight', {{ get: function() {{ return SYN_H; }}, configurable: true }});
+                try {{ syncIframes(cw.document); }} catch (e) {{}}
+              }}
+            }} catch (e) {{}}
+          }}
+        }} catch (e) {{}}
+      }}
+      syncIframes(document);
+      // Re-sync on DOM mutations (iframes added/removed).
+      try {{
+        if (window.MutationObserver && !window.__stealth_iframe_observer) {{
+          var obs = new MutationObserver(function() {{ syncIframes(document); }});
+          obs.observe(document.documentElement, {{ childList: true, subtree: true }});
+          window.__stealth_iframe_observer = obs;
+        }}
+      }} catch (e) {{}}
+    }})();
+
+    // 5d.3 visual viewport (mobile / webview families only). Desktop
+    // families keep the chromium default (VisualViewport reports
+    // platform values, which on a chromium binary are sensible).
+    if ({uach_mobile_jsx}) {{
+      (function() {{
+        var VV_W = {screen_width};
+        var VV_H = {screen_height};
+        var VV_SCALE = {device_pixel_ratio};
+        Object.defineProperty(window, 'visualViewport', {{
+          get: function() {{
+            return {{
+              width: VV_W,
+              height: VV_H,
+              scale: VV_SCALE,
+              offsetLeft: 0,
+              offsetTop: 0,
+              pageLeft: 0,
+              pageTop: 0,
+              addEventListener: function() {{}},
+              removeEventListener: function() {{}},
+              dispatchEvent: function() {{ return true; }}
+            }};
+          }},
+          configurable: true
+        }});
+      }})();
+    }}
+  }} catch (e) {{
+    window.__stealth_last_err = 'm7_2:' + (e && e.message);
+  }}
 {ios_user_agent_data_block}
 {window_webkit_block}
 {build_fingerprint_setter}
@@ -670,6 +777,49 @@ mod tests {
         let seed = FingerprintSeed::ZERO;
         let script = build_init_script(&profile, &seed);
         assert!(!script.contains("Mozilla/5.0"));
+    }
+
+    /// M7.2: Verify the new sections (high-DPI media queries, iframe
+    /// dimensions, visual viewport) are present in the init script and
+    /// the profile-driven values make it through to the JS payload.
+    #[test]
+    fn init_script_contains_m7_2_viewport_sections() {
+        // Desktop profile: visualViewport NOT injected (desktop families
+        // rely on chromium default for visual viewport).
+        let desktop = DeviceProfileId::DesktopChrome148Win11.profile();
+        let seed = FingerprintSeed::ZERO;
+        let desktop_script = build_init_script(&desktop, &seed);
+        assert!(
+            desktop_script.contains("M7.2 high-DPI media queries"),
+            "desktop script missing M7.2 high-DPI MQ section"
+        );
+        assert!(
+            desktop_script.contains("iframe contentWindow"),
+            "desktop script missing M7.2 iframe dimensions section"
+        );
+        // Desktop has uach.mobile=false, so visualViewport section is wrapped
+        // in `if ({uach_mobile_jsx})` and is present in the script but
+        // never executes. The 5d.3 comment + VV_W reference is still in
+        // the source.
+        assert!(
+            desktop_script.contains("visualViewport"),
+            "desktop script contains visualViewport source (gated by mobile flag)"
+        );
+
+        // Mobile profile: all 3 sections present, visualViewport with
+        // profile-driven values.
+        let mobile = DeviceProfileId::AndroidChromePixel7.profile();
+        let mobile_script = build_init_script(&mobile, &seed);
+        assert!(mobile_script.contains("M7.2 high-DPI media queries"));
+        assert!(mobile_script.contains("iframe contentWindow"));
+        assert!(mobile_script.contains("visualViewport"));
+        // Mobile profile width/height/dpr visible in iframe + visual viewport sections.
+        assert!(mobile_script.contains("412")); // screen.width for pixel7
+        assert!(mobile_script.contains("915")); // screen.height for pixel7
+
+        // High-DPI MQ logic: must reference min-/max-resolution regex.
+        assert!(mobile_script.contains("resolution"));
+        assert!(mobile_script.contains("dppx"));
     }
 
     #[test]
