@@ -185,6 +185,100 @@ impl Page {
             applied,
         })
     }
+
+    /// Apply a specific [`DeviceProfile`] directly (M5.5+).
+    ///
+    /// Unlike [`set_fingerprint_seed`](Page::set_fingerprint_seed), this API
+    /// does **not** derive the profile from a seed — it uses the profile
+    /// the caller specifies. Use this to switch the page's fingerprint to
+    /// a known, hand-curated family (e.g. `IosSafariIphone14` for a
+    /// mobile-compat test) without going through the seed-derivation
+    /// hash.
+    ///
+    /// The five M5 desktop profiles (Chrome 120 era) are reachable via
+    /// both APIs. The five M5.5+ families (Chrome 148, iOS Safari, Android
+    /// Chrome, Android System WebView, iOS WKWebView) are reachable only via
+    /// this API — they are not in the seed-derivation hash.
+    ///
+    /// The applied `BrowserContext` fingerprint is **deterministic per
+    /// profile** (not per seed) — calling `set_device_profile(X)` twice
+    /// produces identical fingerprints.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use chromiumoxide::{Browser, BrowserConfig};
+    /// # use chromiumoxide::stealth::DeviceProfileId;
+    /// # async fn demo() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let (browser, _handler) = Browser::launch(BrowserConfig::builder().with_head().build()?).await?;
+    /// # let page = browser.new_page("about:blank").await?;
+    /// let report = page.set_device_profile(DeviceProfileId::AndroidChromePixel7).await?;
+    /// println!("switched to profile: {:?}", report.profile_id);
+    /// // ... later, switch to a different family:
+    /// let report2 = page.set_device_profile(DeviceProfileId::IosSafariIphone14).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn set_device_profile(
+        &self,
+        profile_id: DeviceProfileId,
+    ) -> Result<FingerprintApplicationReport> {
+        let profile = profile_id.profile();
+
+        // 1. CDP-level overrides that must precede the script
+        //    (UA + Accept-Language header, timezone).
+        let effective_ua = profile.user_agent();
+        let effective_accept_language = profile.locale.accept_language.to_string();
+        let effective_platform = profile.os.platform.to_string();
+
+        let ua_params = SetUserAgentOverrideParams {
+            user_agent: effective_ua,
+            accept_language: Some(effective_accept_language),
+            platform: Some(effective_platform),
+            user_agent_metadata: None,
+        };
+        self.execute(ua_params).await?;
+        let mut applied = Vec::with_capacity(4);
+        applied.push(AppliedStep {
+            name: "Network.setUserAgentOverride",
+            no_op: false,
+        });
+
+        let tz_params = SetTimezoneOverrideParams {
+            timezone_id: profile.locale.timezone_id.to_string(),
+        };
+        self.execute(tz_params).await?;
+        applied.push(AppliedStep {
+            name: "Emulation.setTimezoneOverride",
+            no_op: false,
+        });
+
+        // 2. Build the script and inject it.
+        let script = build_init_script(&profile, &FingerprintSeed::ZERO);
+        let add_params = AddScriptToEvaluateOnNewDocumentParams {
+            source: script.clone(),
+            world_name: None,
+            include_command_line_api: None,
+            run_immediately: None,
+        };
+        self.execute(add_params).await?;
+        applied.push(AppliedStep {
+            name: "Page.addScriptToEvaluateOnNewDocument",
+            no_op: false,
+        });
+
+        // 3. Runtime.evaluate on the current document (pinned main world).
+        let _ = self.evaluate_expression(script).await?;
+        applied.push(AppliedStep {
+            name: "Runtime.evaluate",
+            no_op: false,
+        });
+
+        Ok(FingerprintApplicationReport {
+            seed: FingerprintSeed::ZERO,
+            profile_id,
+            applied,
+        })
+    }
 }
 
 impl From<AlignmentError> for CdpError {
