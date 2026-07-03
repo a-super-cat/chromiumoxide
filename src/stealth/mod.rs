@@ -40,6 +40,7 @@ pub mod alignment;
 pub mod params;
 pub mod profiles;
 pub mod script;
+pub mod validator;
 
 pub use alignment::{AlignmentError, AlignmentErrorKind, FingerprintAlignment};
 pub use params::{
@@ -49,6 +50,9 @@ pub use params::{
 pub use profiles::{DeviceFamily, DeviceProfile, DeviceProfileId};
 pub use script::{
     build_init_script, derive_audio_offset, derive_canvas_noise_pixels, CANVAS_NOISE_PIXEL_COUNT,
+};
+pub use validator::{
+    validate_profile, Inconsistency, InconsistencyKind, ValidationReport, Severity,
 };
 
 use crate::cdp::browser_protocol::emulation::SetTimezoneOverrideParams;
@@ -98,6 +102,18 @@ impl Page {
             .profile_override
             .unwrap_or_else(|| DeviceProfileId::from_seed(seed.as_bytes()));
         let profile = profile_id.profile();
+
+        // 1a. M5.5+ fail-fast: validate profile spec before injection.
+        let report = validate_profile(&profile);
+        if report.has_errors() {
+            return Err(CdpError::msg(format!(
+                "DeviceProfile {:?} (from seed) failed validation:\n{}",
+                profile_id, report
+            )));
+        }
+        for w in report.warnings() {
+            tracing::warn!(target: "chromiumoxide::stealth", "{}", w.message);
+        }
 
         // 2. Validate any caller-supplied alignment.
         if let Some(align) = &opts.alignment {
@@ -223,6 +239,21 @@ impl Page {
         profile_id: DeviceProfileId,
     ) -> Result<FingerprintApplicationReport> {
         let profile = profile_id.profile();
+
+        // 0. M5.5+ fail-fast: validate profile spec internal consistency
+        //    before injection. 26 checks across 3 layers (UA / UA-CH /
+        //    navigator / screen / locale / platform / webview). Any
+        //    Severity::Error finding → refuse to inject.
+        let report = validate_profile(&profile);
+        if report.has_errors() {
+            return Err(CdpError::msg(format!(
+                "DeviceProfile {:?} failed validation:\n{}",
+                profile_id, report
+            )));
+        }
+        for w in report.warnings() {
+            tracing::warn!(target: "chromiumoxide::stealth", "{}", w.message);
+        }
 
         // 1. CDP-level overrides that must precede the script
         //    (UA + Accept-Language header, timezone).
