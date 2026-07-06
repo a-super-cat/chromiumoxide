@@ -387,6 +387,7 @@ fn build_init_script_with_build_fingerprint(
   try {{
     var PLUGINS_JSON = {plugins_json};
     var MIME_TYPES_JSON = {mime_types_json};
+    var PLUGIN_DESCRIPTION = 'Portable Document Format';
     // Build a PluginArray-like object that mirrors the M3 chromium source patch
     // but is populated from the profile's plugins slice.
     var fakePlugins = Object.create(PluginArray.prototype);
@@ -395,12 +396,41 @@ fn build_init_script_with_build_fingerprint(
       Object.defineProperties(plugin, {{
         name: {{ value: p.name, enumerable: true }},
         filename: {{ value: p.filename, enumerable: true }},
+        description: {{ value: PLUGIN_DESCRIPTION, enumerable: true }},
         length: {{ value: 1, enumerable: true }},
-        0: {{ value: {{ type: 'application/pdf', suffixes: 'pdf', description: p.name }}, enumerable: true }}
+        0: {{ value: {{ type: 'application/pdf', suffixes: 'pdf', description: PLUGIN_DESCRIPTION }}, enumerable: true }}
       }});
       Object.defineProperty(fakePlugins, i, {{ value: plugin, enumerable: true }});
+      Object.defineProperty(fakePlugins, p.name, {{ value: plugin, enumerable: false }});
     }});
     Object.defineProperty(fakePlugins, 'length', {{ value: PLUGINS_JSON.length, enumerable: true }});
+    Object.defineProperties(fakePlugins, {{
+      item: {{
+        value: function (index) {{ return this[index] || null; }},
+        enumerable: false
+      }},
+      namedItem: {{
+        value: function (name) {{
+          for (var i = 0; i < this.length; i++) {{
+            if (this[i] && this[i].name === name) return this[i];
+          }}
+          return null;
+        }},
+        enumerable: false
+      }},
+      refresh: {{
+        value: function () {{}},
+        enumerable: false
+      }}
+    }});
+    if (typeof Symbol !== 'undefined' && Symbol.iterator) {{
+      Object.defineProperty(fakePlugins, Symbol.iterator, {{
+        value: function* () {{
+          for (var i = 0; i < this.length; i++) yield this[i];
+        }},
+        enumerable: false
+      }});
+    }}
     overrideGetter('plugins', function () {{ return fakePlugins; }});
 
     // Build a MimeTypeArray
@@ -1160,6 +1190,26 @@ mod tests {
         assert!(script.contains("local-candidate"));
         assert!(script.contains("remote-candidate"));
         assert!(script.contains("sanitizeStat"));
+    }
+
+    #[test]
+    fn init_script_defines_plugin_own_description_and_array_methods() {
+        let profile = DeviceProfileId::DesktopChrome148Win11.profile();
+        let seed = FingerprintSeed::ZERO;
+        let script = build_init_script(&profile, &seed);
+
+        assert!(
+            script.contains("description: { value: PLUGIN_DESCRIPTION"),
+            "plugin objects must have an own description property"
+        );
+        assert!(
+            script.contains("Object.defineProperties(fakePlugins"),
+            "PluginArray methods must be own properties on the fake object"
+        );
+        assert!(script.contains("item: {"));
+        assert!(script.contains("namedItem: {"));
+        assert!(script.contains("refresh: {"));
+        assert!(script.contains("Symbol.iterator"));
     }
 
     #[test]
